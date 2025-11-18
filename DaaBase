@@ -1,0 +1,104 @@
+-- DataManager Module for Age of Chivalry
+local DataStoreService = game:GetService("DataStoreService")
+local Players = game:GetService("Players")
+
+local AoC_DataStore = DataStoreService:GetDataStore("AoC_DataStore_v2") -- Changed name to refresh
+
+local DataManager = {}
+local PlayerData = {}
+
+-- Default data template
+local function GetDefaultData()
+    return {
+		Gold = 1,
+		Silver = 10,
+        Level = 0,
+        Experience = 0,
+        CurrentSlot = "Slot1",
+        Slot1 = {
+            Slot = {
+				Gold = 1,
+				Silver = 10,
+                Level = 0,
+                Experience = 0,
+                Items = {
+                    Armor = {
+                        Helmets = {
+                            {Name = "TestHelmet", Equipped = false, Index = 1}
+                        },
+                        Chestplates = {
+                            {Name = "TestChestplate", Equipped = false, Index = 1}
+                        },
+                        LegArmor = {
+                            {Name = "TestLegArmor", Equipped = false, Index = 1}
+                        },
+                        ArmArmor = {
+                            {Name = "TestArmArmor", Equipped = false, Index = 1}
+                        },
+                        Belts = {
+                            {Name = "TestBelt", Equipped = false, Index = 1}
+                        },
+                        Back = {}
+                    },
+                    Weapons = {},
+                    Mounts = {},
+                    Boosters = {},
+                    Secondarys = {}
+                }
+            }
+        }
+    }
+end
+
+function DataManager:Get(Player)
+    return PlayerData[Player.UserId]
+end
+
+function DataManager:Set(Player, Data)
+    PlayerData[Player.UserId] = Data
+end
+
+function DataManager:LoadData(Player)
+    local UserId = Player.UserId
+    local success, data
+    
+    pcall(function()
+        success, data = pcall(function()
+            return AoC_DataStore:GetAsync("Player_"..UserId)
+        end)
+    end)
+    
+    if success and data then
+        PlayerData[UserId] = data
+        print("Loaded data for " .. Player.Name)
+    else
+        -- New player or failed to load, give default data
+        PlayerData[UserId] = GetDefaultData()
+        print("Created new data for " .. Player.Name)
+    end
+    
+    return PlayerData[UserId]
+end
+
+function DataManager:SaveData(Player)
+    local UserId = Player.UserId
+    local data = PlayerData[UserId]
+    
+    if data then
+        local success, err = pcall(function()
+            AoC_DataStore:SetAsync("Player_"..UserId, data)
+        end)
+        
+        if success then
+            print("Saved data for " .. Player.Name)
+        else
+            warn("Failed to save data for " .. Player.Name .. ": " .. tostring(err))
+        end
+    end
+end
+
+function DataManager:RemoveData(Player)
+    PlayerData[Player.UserId] = nil
+end
+
+return DataManager
