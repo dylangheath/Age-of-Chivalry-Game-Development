@@ -1,7 +1,11 @@
 https://github.com/user-attachments/assets/9051611d-b941-44ac-a52d-52c0f5653499
 
 Age of Chivalry 🏰⚔️
-A medieval Roblox game featuring mounted combat, jousting tournaments, and third-person action gameplay.
+A medieval Roblox game featuring mounted c
+
+https://github.com/user-attachments/assets/80c8fc4e-03bf-483a-9686-419a5764f622
+
+ombat, jousting tournaments, and third-person action gameplay.
 🎮 Project Overview
 Age of Chivalry is an immersive medieval combat experience built in Roblox, combining realistic horse mechanics, jousting physics, and a custom third-person camera system for an authentic knight combat experience.
 
