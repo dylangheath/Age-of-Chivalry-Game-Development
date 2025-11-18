@@ -1,0 +1,512 @@
+-- Services
+local userInputService = game:GetService("UserInputService")
+local runService = game:GetService("RunService")
+local players = game:GetService("Players")
+local proximityPromptService = game:GetService("ProximityPromptService")
+local replicatedStorage = game:GetService("ReplicatedStorage")
+local debris = game:GetService("Debris")
+
+-- Player and Character
+local player = players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local playerAnimator = humanoid:WaitForChild("Animator")
+
+-- === CONFIGURATION ===
+local TURN_SPEED = 1
+local ACCEL_RATE = 5
+local DECEL_RATE = 0.4
+local REVERSE_SPEED = 5
+local STRAFE_SPEED = 6
+local STRAFE_SPEED_THRESHOLD = 2
+local RALLY_DURATION = 4.4
+local SHIFT_COOLDOWN = 2
+
+-- Camera shake settings
+local CAMERA_SHAKE_INTENSITY = 0.13
+local CAMERA_SHAKE_SPEED = 10
+
+-- !! PLAYER ANIMATION IDs !!
+local PLAYER_RIDING_ID = "rbxassetid://106485698837700" 
+local PLAYER_KICK_ID = "rbxassetid://117076548491777"
+
+-- SPEED STATE MACHINE
+local SPEEDS = {
+	{level = 1, speed = 8, name = "Walk"},
+	{level = 2, speed = 25, name = "Trot"},
+	{level = 3, speed = 40, name = "Gallop"}
+}
+local NUM_SPEEDS = #SPEEDS
+local MAX_SPEED_LEVEL = 3
+
+-- State
+local isSeatedOnHorse = false
+local isRallying = false
+local steerConnection = nil
+local renderSteerConnection = nil 
+local inputBeganConnection = nil 
+local inputEndedConnection = nil 
+local shiftBeganConnection = nil 
+local rallyBeganConnection = nil
+
+local currentHorse = nil
+local currentRoot = nil
+local bodyGyro = nil
+local bodyVelocity = nil
+local bodyAngularVelocity = nil
+
+local currentTurn = 0
+local playerRidingTrack = nil
+local playerKickTrack = nil
+
+local currentSpeedLevel = 1 
+local currentSpeed = 0 
+local lastShiftTime = 0
+
+-- Camera shake variables (stored in _G for camera script to access)
+_G.HorseCameraShake = {
+	active = false,
+	intensity = 0,
+	time = 0
+}
+
+-- Audio folders
+local horseWhineFolder = nil
+
+-- Networking
+local animateHorseEvent = replicatedStorage:WaitForChild("AnimateHorse")
+local rallyHorseEvent = replicatedStorage:WaitForChild("RallyHorse")
+local coastHorseEvent = replicatedStorage:WaitForChild("CoastHorse")
+local lastPlayedAnim = ""
+local lastTurnValue = 0
+
+local inputs = {
+	[Enum.KeyCode.W] = 0,
+	[Enum.KeyCode.S] = 0,
+	[Enum.KeyCode.A] = 0,
+	[Enum.KeyCode.D] = 0,
+}
+
+-- Helper function (Lerp)
+local function lerp(a, b, t)
+	return a + (b - a) * t
+end
+
+-- Function to play random whine sound
+local function playWhineSound()
+	if not horseWhineFolder or not currentRoot then return end
+	
+	local sounds = horseWhineFolder:GetChildren()
+	if #sounds == 0 then return end
+	
+	local randomSound = sounds[math.random(1, #sounds)]
+	local soundClone = randomSound:Clone()
+	soundClone.Parent = currentRoot
+	soundClone.RollOffMaxDistance = 10000
+	soundClone.PlaybackSpeed = math.random(95, 105) / 100
+	soundClone.Volume = math.random(70, 90) / 100
+	soundClone:Play()
+	debris:AddItem(soundClone, 3)
+end
+
+-- Function to handle rally (C key)
+local function handleRally(input, gameProcessed)
+	if gameProcessed or not isSeatedOnHorse or isRallying then return end
+	if input.KeyCode ~= Enum.KeyCode.C or input.UserInputState ~= Enum.UserInputState.Begin then
+		return
+	end
+	
+	local absCurrentSpeed = math.abs(currentSpeed)
+	if absCurrentSpeed >= STRAFE_SPEED_THRESHOLD then
+		print("[Client] Too fast to rally! Slow down first.")
+		return
+	end
+	
+	print("[Client] Starting rally!")
+	isRallying = true
+	
+	rallyHorseEvent:FireServer(currentHorse)
+	
+	task.wait(RALLY_DURATION)
+	
+	isRallying = false
+	print("[Client] Rally finished!")
+	
+	return Enum.UserInputState.Cancel
+end
+
+-- Function to handle speed cycling with cooldown and sound
+local function handleSpeedCycle(input, gameProcessed)
+	if gameProcessed or not isSeatedOnHorse or isRallying then return end
+	if input.KeyCode ~= Enum.KeyCode.LeftShift or input.UserInputState ~= Enum.UserInputState.Begin then
+		return
+	end
+	if inputs[Enum.KeyCode.S] == 1 then return Enum.UserInputState.Cancel end
+	
+	local currentTime = tick()
+	if currentTime - lastShiftTime < SHIFT_COOLDOWN then
+		print("[Client] Shift cooldown active")
+		return Enum.UserInputState.Cancel
+	end
+	
+	if currentSpeedLevel < MAX_SPEED_LEVEL and inputs[Enum.KeyCode.W] == 1 then
+		if playerKickTrack then playerKickTrack:Play() end
+		
+		playWhineSound()
+		
+		currentSpeedLevel = currentSpeedLevel + 1
+		lastShiftTime = currentTime
+		
+		print("[Client] Speed increased to level", currentSpeedLevel)
+	end
+	
+	return Enum.UserInputState.Cancel
+end
+
+-- This function runs on PHYSICS (Heartbeat)
+
+local lastSpeed = 0
+local function onSteer(dt)
+	if isRallying then
+		bodyVelocity.Velocity = Vector3.new(0, 0, 0)
+		bodyAngularVelocity.AngularVelocity = Vector3.new(0, 0, 0)
+		return
+	end
+	
+	local moveForward = inputs[Enum.KeyCode.W] - inputs[Enum.KeyCode.S]
+	currentTurn = inputs[Enum.KeyCode.A] - inputs[Enum.KeyCode.D]
+
+	if not isSeatedOnHorse or not currentRoot or not bodyVelocity or not bodyGyro then return end
+
+	local targetMaxSpeed = SPEEDS[currentSpeedLevel].speed
+	local targetVelocityScalar = 0
+	if moveForward > 0 then 
+		targetVelocityScalar = targetMaxSpeed
+	elseif moveForward < 0 then 
+		targetVelocityScalar = REVERSE_SPEED 
+	end
+
+	local targetLerpSpeed = targetVelocityScalar * moveForward
+	local currentRate = (moveForward == 0 and math.abs(currentSpeed) > 0.1) and DECEL_RATE or ACCEL_RATE
+	currentSpeed = lerp(currentSpeed, targetLerpSpeed, dt * currentRate)
+
+	if inputs[Enum.KeyCode.W] == 0 and currentSpeedLevel > 1 and math.abs(currentSpeed) < SPEEDS[1].speed then
+		currentSpeedLevel = 1
+	end
+
+	if inputs[Enum.KeyCode.S] == 1 and currentSpeedLevel > 1 then
+		currentSpeedLevel = math.max(1, currentSpeedLevel - 1)
+	end
+
+	local absCurrentSpeed = math.abs(currentSpeed)
+	if math.abs(currentSpeed) < 6 then
+		currentSpeed = lerp(currentSpeed, 0, dt * 1.5)
+	end
+	
+	local animName = "Idle"
+	local moveDirection = currentRoot.CFrame.LookVector
+	local actualVelocity = moveDirection * currentSpeed
+
+	local shouldStrafe = (currentSpeedLevel < 3 and absCurrentSpeed < STRAFE_SPEED_THRESHOLD)
+	
+	if shouldStrafe and currentTurn ~= 0 then
+		if currentTurn > 0 then
+			animName = "StrafeLeft"
+			actualVelocity = -currentRoot.CFrame.RightVector * STRAFE_SPEED
+		elseif currentTurn < 0 then
+			animName = "StrafeRight"
+			actualVelocity = currentRoot.CFrame.RightVector * STRAFE_SPEED
+		end
+		bodyAngularVelocity.AngularVelocity = Vector3.new(0, 0, 0)
+		
+	else
+		bodyAngularVelocity.AngularVelocity = Vector3.new(0, currentTurn * TURN_SPEED, 0)
+		
+		if absCurrentSpeed > 0.5 then
+			if currentSpeedLevel == 3 and absCurrentSpeed > SPEEDS[2].speed then
+				animName = "Gallop"
+			elseif currentSpeedLevel >= 2 and absCurrentSpeed > SPEEDS[1].speed then
+				animName = "Trot"
+			else
+				animName = "Walk"
+			end
+		end
+	end
+
+	bodyVelocity.Velocity = actualVelocity
+
+	local speedChanged = (math.abs(currentSpeed - (lastSpeed or 0)) > 0.1)
+
+	local animChanged = (animName ~= lastPlayedAnim)
+	local turnChanged = (currentTurn ~= lastTurnValue)
+
+	if animChanged or turnChanged or speedChanged then
+		local animSpeed = 1
+
+		if animName == "Walk" then
+			local absSpeed = math.abs(currentSpeed)
+			animSpeed = lerp(0.5, 1.4, math.clamp(absSpeed / SPEEDS[1].speed, 0, 1))
+		end
+
+		animSpeed = math.clamp(animSpeed, 0.5, 1.4)
+
+		animateHorseEvent:FireServer(currentHorse, animName, currentTurn, currentSpeedLevel, animSpeed)
+
+		lastPlayedAnim = animName
+		lastTurnValue = currentTurn
+		lastSpeed = currentSpeed
+	end
+end
+
+-- This function runs AFTER animations (RenderStepped) - Updates camera shake data
+local function onRenderStep(dt)
+	if not isSeatedOnHorse then 
+		_G.HorseCameraShake.active = false
+		return 
+	end
+	
+	local absCurrentSpeed = math.abs(currentSpeed)
+	
+	if lastPlayedAnim == "Trot" or lastPlayedAnim == "Gallop" then
+		local normalizedSpeed = math.clamp(absCurrentSpeed / SPEEDS[3].speed, 0, 1)
+		local shakeIntensity = CAMERA_SHAKE_INTENSITY * normalizedSpeed
+		
+		local shakeSpeed = CAMERA_SHAKE_SPEED
+		if lastPlayedAnim == "Gallop" then
+			shakeSpeed = CAMERA_SHAKE_SPEED * 1.5
+		end
+		
+		_G.HorseCameraShake.active = true
+		_G.HorseCameraShake.intensity = shakeIntensity
+		_G.HorseCameraShake.time = _G.HorseCameraShake.time + dt * shakeSpeed
+	else
+		_G.HorseCameraShake.active = false
+		_G.HorseCameraShake.time = 0
+	end
+	
+	--
+	
+	local pitch, yaw, roll = currentRoot.CFrame:ToEulerAnglesYXZ()
+
+	-- reduce forward/back pitch by 50%
+	local correctedPitch = pitch * 0.5
+
+	local baseCF = CFrame.new(currentRoot.Position)
+		* CFrame.Angles(correctedPitch, yaw, 0)
+
+	-- Compute lean (Z-axis roll)
+	local speedFactor = math.clamp(math.abs(currentSpeed) / SPEEDS[3].speed, 0, 1)
+	local leanAmount = math.clamp(currentTurn * speedFactor * 0.35, -0.35, 0.35)
+
+	-- Apply yaw + lean safely
+	bodyGyro.CFrame = baseCF * CFrame.Angles(0, 0, leanAmount)
+end
+
+-- This function handles key presses (WASD)
+local function onInput(input, gameProcessed)
+	if gameProcessed or not isSeatedOnHorse or isRallying then return end
+	if inputs[input.KeyCode] ~= nil then
+		inputs[input.KeyCode] = (input.UserInputState == Enum.UserInputState.Begin) and 1 or 0
+	end
+end
+
+-- NEW: Function to make horse coast to a stop naturally
+local function makeHorseCoast(startVelocity)
+	local horse = currentHorse
+	local root = currentRoot
+	
+	if not horse or not root then 
+		print("[Horse] Cannot coast - no horse or root")
+		return 
+	end
+	
+	print("[Horse] Starting natural deceleration from speed:", startVelocity.Magnitude)
+	
+	-- Create a temporary deceleration loop
+	local coastConnection = nil
+	coastConnection = runService.Heartbeat:Connect(function(dt)
+		if not root or not root.Parent then
+			print("[Horse] Coast ended - root destroyed")
+			if coastConnection then coastConnection:Disconnect() end
+			return
+		end
+		
+		-- Don't interfere if someone else mounts
+		if root.Parent:FindFirstChild("Seat") then
+			local seat = root.Parent.Seat
+			if seat.Occupant then
+				print("[Horse] Coast ended - someone mounted")
+				if coastConnection then coastConnection:Disconnect() end
+				return
+			end
+		end
+		
+		-- Get current velocity
+		local velocity = root.AssemblyLinearVelocity
+		local speed = velocity.Magnitude
+		
+		-- Decelerate using same rate as normal riding
+		if speed > 0.5 then
+			local newSpeed = math.max(0, speed - (speed * DECEL_RATE * dt))
+			if speed > 0.01 then
+				local direction = velocity.Unit
+				root.AssemblyLinearVelocity = direction * newSpeed
+			end
+		else
+			-- Horse has stopped
+			root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+			root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+			
+			print("[Horse] Naturally stopped")
+			if coastConnection then 
+				coastConnection:Disconnect()
+			end
+		end
+	end)
+	
+	-- Safety timeout - stop after 10 seconds max
+	task.delay(10, function()
+		if coastConnection then
+			print("[Horse] Coast timeout reached")
+			coastConnection:Disconnect()
+		end
+	end)
+end
+
+-- This runs when the player sits or stands
+humanoid.Seated:Connect(function(active, seat)
+
+	if active and seat and seat.Name == "Seat" and seat.Parent:FindFirstChild("Humanoid") then
+		-- PLAYER SAT DOWN ON A HORSE
+		print("Player sat on a horse seat.")
+		isSeatedOnHorse = true
+		currentHorse = seat.Parent
+		currentRoot = currentHorse:WaitForChild("RootPart")
+		currentRoot.Anchored = false
+		
+		horseWhineFolder = currentHorse:FindFirstChild("Horse_Whine")
+
+		-- === PHYSICS SETUP ===
+		bodyGyro = Instance.new("BodyGyro", currentRoot)
+		bodyGyro.P = 50000
+		bodyGyro.D = 3000
+		bodyGyro.MaxTorque = Vector3.new(400000, 0, 400000)
+		bodyGyro.CFrame = currentRoot.CFrame
+		bodyVelocity = Instance.new("BodyVelocity", currentRoot)
+		bodyVelocity.MaxForce = Vector3.new(100000, 0, 100000)
+		bodyVelocity.Velocity = Vector3.new(0, 0, 0)
+		bodyAngularVelocity = Instance.new("BodyAngularVelocity", currentRoot)
+		bodyAngularVelocity.MaxTorque = Vector3.new(0, 100000, 0)
+		bodyAngularVelocity.AngularVelocity = Vector3.new(0, 0, 0)
+
+		-- === LOAD PLAYER ANIMATIONS ===
+		local playerRidingAnim = Instance.new("Animation")
+		playerRidingAnim.AnimationId = PLAYER_RIDING_ID
+		playerRidingTrack = playerAnimator:LoadAnimation(playerRidingAnim)
+		playerRidingTrack.Priority = Enum.AnimationPriority.Idle
+
+		local playerKickAnim = Instance.new("Animation")
+		playerKickAnim.AnimationId = PLAYER_KICK_ID
+		playerKickTrack = playerAnimator:LoadAnimation(playerKickAnim)
+		playerKickTrack.Priority = Enum.AnimationPriority.Action
+
+		print("[Client] Loaded player riding and kick animations")
+
+		if playerRidingTrack then playerRidingTrack:Play() end
+
+		inputBeganConnection = userInputService.InputBegan:Connect(onInput)
+		inputEndedConnection = userInputService.InputEnded:Connect(onInput)
+		shiftBeganConnection = userInputService.InputBegan:Connect(handleSpeedCycle)
+		rallyBeganConnection = userInputService.InputBegan:Connect(handleRally)
+		steerConnection = runService.Heartbeat:Connect(onSteer)
+		renderSteerConnection = runService.RenderStepped:Connect(onRenderStep)
+
+		currentSpeedLevel = 1
+		currentSpeed = 0
+		lastShiftTime = 0
+		_G.HorseCameraShake.time = 0
+
+	elseif not active then
+		-- PLAYER STOOD UP - Natural deceleration instead of immediate stop
+		print("Player stood up.")
+		isSeatedOnHorse = false
+		isRallying = false
+		_G.HorseCameraShake.active = false
+		
+		if steerConnection then steerConnection:Disconnect() end
+		if renderSteerConnection then renderSteerConnection:Disconnect() end
+		if inputBeganConnection then inputBeganConnection:Disconnect() end
+		if inputEndedConnection then inputEndedConnection:Disconnect() end
+		if shiftBeganConnection then shiftBeganConnection:Disconnect() end
+		if rallyBeganConnection then rallyBeganConnection:Disconnect() end
+
+		if playerRidingTrack then playerRidingTrack:Stop() end
+		if playerKickTrack then playerKickTrack:Stop() end
+
+		if currentHorse then
+			animateHorseEvent:FireServer(currentHorse, "Idle", 0, 1)
+		end
+
+		-- Tell server to handle the coast with current speed
+		print("[Client] Player dismounted, telling server to coast")
+		
+		-- Save references for delayed cleanup
+		local gyroToDestroy = bodyGyro
+		local angVelToDestroy = bodyAngularVelocity  
+		local velToDestroy = bodyVelocity
+		
+		if currentHorse then
+			coastHorseEvent:FireServer(currentHorse, currentSpeed)
+		end
+		
+		-- Wait a moment for server to create its own physics objects
+		task.delay(0.15, function()
+			-- Now safe to destroy client physics objects
+			if gyroToDestroy and gyroToDestroy.Parent then 
+				gyroToDestroy:Destroy() 
+			end
+			if angVelToDestroy and angVelToDestroy.Parent then 
+				angVelToDestroy:Destroy() 
+			end
+			if velToDestroy and velToDestroy.Parent then 
+				velToDestroy:Destroy() 
+			end
+			print("[Client] Cleaned up physics objects")
+		end)
+
+		for k in pairs(inputs) do inputs[k] = 0 end
+		currentSpeedLevel = 1
+		currentSpeed = 0
+		currentTurn = 0
+		lastPlayedAnim = ""
+		lastTurnValue = 0
+		lastShiftTime = 0
+		currentHorse = nil
+		currentRoot = nil
+		horseWhineFolder = nil
+		playerRidingTrack = nil
+		playerKickTrack = nil
+		bodyGyro = nil
+		bodyVelocity = nil
+		bodyAngularVelocity = nil
+		steerConnection = nil
+		renderSteerConnection = nil
+		inputBeganConnection = nil
+		inputEndedConnection = nil
+		shiftBeganConnection = nil
+		rallyBeganConnection = nil
+	end
+end)
+
+proximityPromptService.PromptTriggered:Connect(function(prompt, triggerPlayer)
+	if triggerPlayer ~= player then return end
+	local seat = prompt.Parent
+	if seat and seat:IsA("Seat") and prompt.ActionText == "Mount" then
+		local horse = seat.Parent
+		if horse and horse:FindFirstChild("Humanoid") and horse.Name == "Horse" then
+			seat:Sit(humanoid)
+		end
+	end
+end)
+
+print("[Horse Client] Initialized with natural deceleration on dismount")
