@@ -1,17 +1,9 @@
-https://github.com/user-attachments/assets/9051611d-b941-44ac-a52d-52c0f5653499
-
-Age of Chivalry 🏰⚔️
-A medieval Roblox game featuring mounted combat, jousting tournaments, and third-person action gameplay.
-
-
-https://github.com/user-attachments/assets/80c8fc4e-03bf-483a-9686-419a5764f622
-
-
 # Age of Chivalry 🏰⚔️
 
 A large-scale medieval combat game on Roblox supporting 200 concurrent players.
 
-![Game Banner](screenshots/banner.png)
+<img width="1376" height="768" alt="AoC Jousting Fail" src="https://github.com/user-attachments/assets/b285a6e1-5ddf-4e58-b12f-a52c32dc157c" />
+
 
 ## 🎮 Play Now
 https://www.roblox.com/games/13387639494/Age-of-Chivalry
@@ -56,11 +48,10 @@ https://www.roblox.com/games/13387639494/Age-of-Chivalry
 
 ## 📸 Screenshots
 
-[Add gameplay screenshots here]
 
 ## 🎥 Gameplay Video
+https://www.youtube.com/watch?v=5TY0zBCsTvU
 
-[Add YouTube/video link here]
 
 ## 📈 Development Highlights
 - Implemented custom spawn system with safe zones and capture point spawning
